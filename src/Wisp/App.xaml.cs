@@ -120,7 +120,7 @@ public partial class App : Application
         string text;
         if (snap?.Session is { } s)
         {
-            text = $"Session {Math.Round(s.Percent):0}% · resets in {MainWindow.FormatReset(s.ResetsAt)}";
+            text = $"Session {Math.Round(s.Percent):0}% · resets in {Wisp.MainWindow.FormatReset(s.ResetsAt)}";
             if (snap.Week is { } w) text += $" · week {Math.Round(w.Percent):0}%";
         }
         else
