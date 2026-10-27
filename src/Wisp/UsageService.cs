@@ -14,7 +14,13 @@ public sealed record UsageWindow(double Percent, DateTimeOffset? ResetsAt);
 
 public sealed record UsageSnapshot(UsageWindow? Session, UsageWindow? Week, string Source, DateTimeOffset FetchedAt);
 
-public sealed class UsageException(string message) : Exception(message);
+public class UsageException(string message) : Exception(message);
+
+/// <summary>Anthropic asked us to back off; don't call again until <see cref="RetryAfter"/> has passed.</summary>
+public sealed class RateLimitedException(TimeSpan retryAfter) : UsageException("Anthropic asked Wisp to slow down")
+{
+    public TimeSpan RetryAfter { get; } = retryAfter;
+}
 
 /// <summary>
 /// Reads plan usage (the 5-hour session window and the weekly window) from Anthropic.
@@ -42,8 +48,6 @@ public sealed class UsageService : IDisposable
             UseCookies = false,
         };
         _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 Wisp/1.0");
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
@@ -58,19 +62,41 @@ public sealed class UsageService : IDisposable
         }
     }
 
-    public async Task<UsageSnapshot> FetchAsync(string? sessionKey, CancellationToken ct)
+    /// <summary>
+    /// Fetches usage over the network. The OAuth endpoint is skipped until <paramref name="oauthBlockedUntil"/>;
+    /// when it rate-limits us, <paramref name="onOAuthRateLimited"/> gets the time it's OK to try again.
+    /// </summary>
+    public async Task<UsageSnapshot> FetchAsync(string? sessionKey, DateTimeOffset oauthBlockedUntil,
+        Action<DateTimeOffset> onOAuthRateLimited, CancellationToken ct)
     {
-        var token = ReadOAuthToken(out var oauthError);
-        if (token != null)
+        UsageException? oauthError = null;
+        if (DateTimeOffset.UtcNow >= oauthBlockedUntil)
         {
-            try { return await FetchOAuthAsync(token, ct); }
-            catch (UsageException e) when (!string.IsNullOrWhiteSpace(sessionKey)) { oauthError = e.Message; }
+            var token = ReadOAuthToken(out var tokenError);
+            if (token != null)
+            {
+                try { return await FetchOAuthAsync(token, ct); }
+                catch (RateLimitedException e)
+                {
+                    onOAuthRateLimited(DateTimeOffset.UtcNow + e.RetryAfter);
+                    oauthError = e;
+                }
+                catch (UsageException e) { oauthError = e; }
+            }
+            else if (tokenError != null)
+            {
+                oauthError = new UsageException(tokenError);
+            }
+        }
+        else
+        {
+            oauthError = new RateLimitedException(oauthBlockedUntil - DateTimeOffset.UtcNow);
         }
 
         if (!string.IsNullOrWhiteSpace(sessionKey))
             return await FetchWebAsync(sessionKey.Trim(), ct);
 
-        throw new UsageException(oauthError ?? "No Claude login found");
+        throw oauthError ?? new UsageException("No Claude login found");
     }
 
     static string? ReadOAuthToken(out string? error)
@@ -105,6 +131,7 @@ public sealed class UsageService : IDisposable
         using var req = new HttpRequestMessage(HttpMethod.Get, OAuthUsageUrl);
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         req.Headers.Add("anthropic-beta", "oauth-2025-04-20");
+        req.Headers.UserAgent.ParseAdd("Wisp/0.1 (+https://github.com/fabiolage/claude-wisp)");
 
         using var res = await Send(req, ct);
         if (res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
@@ -169,6 +196,8 @@ public sealed class UsageService : IDisposable
         var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Add("Cookie", $"sessionKey={sessionKey}");
         req.Headers.Referrer = new Uri("https://claude.ai/settings/usage");
+        req.Headers.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36");
         return req;
     }
 
@@ -182,9 +211,15 @@ public sealed class UsageService : IDisposable
     static Task EnsureOk(HttpResponseMessage res)
     {
         if (res.IsSuccessStatusCode) return Task.CompletedTask;
-        throw new UsageException(res.StatusCode == HttpStatusCode.TooManyRequests
-            ? "Rate limited · retrying"
-            : $"Server said {(int)res.StatusCode}");
+        if (res.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var wait = res.Headers.RetryAfter?.Delta
+                ?? (res.Headers.RetryAfter?.Date is { } d ? d - DateTimeOffset.UtcNow : null);
+            // Missing or zero Retry-After still means "not now": wait at least 15 minutes, at most 2 hours.
+            var seconds = Math.Clamp(wait?.TotalSeconds ?? 0, 15 * 60, 2 * 60 * 60);
+            throw new RateLimitedException(TimeSpan.FromSeconds(seconds));
+        }
+        throw new UsageException($"Server said {(int)res.StatusCode}");
     }
 
     static UsageSnapshot Parse(JsonElement root, string source) =>

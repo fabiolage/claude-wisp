@@ -33,6 +33,14 @@ public sealed class Settings
 
     public bool Hidden { get; set; }
 
+    /// <summary>Minimum minutes between calls to Anthropic's usage endpoint (Claude Code's feed is used in between).</summary>
+    public int ApiMinutes { get; set; } = 10;
+
+    /// <summary>Anthropic rate-limited the OAuth usage endpoint; don't call it again before this time.</summary>
+    public DateTimeOffset OAuthBlockedUntil { get; set; }
+
+    public bool OfferedClaudeCodeConnect { get; set; }
+
     /// <summary>claude.ai sessionKey cookie, encrypted with Windows DPAPI for the current user.</summary>
     public string? SessionKeyProtected { get; set; }
 

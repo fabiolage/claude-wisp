@@ -16,6 +16,7 @@ public partial class App : Application
     Forms.NotifyIcon _tray = null!;
     Forms.ToolStripMenuItem _header = null!;
     Forms.ToolStripMenuItem _toggle = null!;
+    Forms.ToolStripMenuItem _claudeCode = null!;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -35,6 +36,54 @@ public partial class App : Application
 
         if (!_settings.Hidden) _widget.Show();
         UpdateToggleText();
+        OfferClaudeCodeFeed();
+    }
+
+    /// <summary>
+    /// Anthropic's usage endpoint rate-limits third-party apps hard, so the best source is Claude Code itself.
+    /// Offer (once) to plug Wisp into Claude Code's status line.
+    /// </summary>
+    void OfferClaudeCodeFeed()
+    {
+        if (_settings.OfferedClaudeCodeConnect || ClaudeCodeFeed.IsConnected() ||
+            !System.IO.File.Exists(UsageService.CredentialsPath))
+            return;
+
+        _settings.OfferedClaudeCodeConnect = true;
+        _settings.Save();
+        _tray.BalloonTipClicked += OnOfferClicked;
+        _tray.ShowBalloonTip(15000, "Get live usage from Claude Code",
+            "Click here to let Claude Code send its usage to Wisp as you work. You can undo it from the tray menu.",
+            Forms.ToolTipIcon.Info);
+    }
+
+    void OnOfferClicked(object? sender, EventArgs e)
+    {
+        _tray.BalloonTipClicked -= OnOfferClicked;
+        ConnectClaudeCode();
+        _claudeCode.Checked = ClaudeCodeFeed.IsConnected();
+    }
+
+    void ConnectClaudeCode()
+    {
+        var result = ClaudeCodeFeed.Connect(replaceExisting: false);
+        if (result == ClaudeCodeFeed.ConnectResult.OtherStatusLine)
+        {
+            var answer = System.Windows.MessageBox.Show(
+                "Claude Code already has a custom status line. Replace it with Wisp's?\n\n" +
+                "Your current settings are backed up next to them as settings.json.wisp-backup.",
+                "Wisp", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes) return;
+            result = ClaudeCodeFeed.Connect(replaceExisting: true);
+        }
+
+        if (result == ClaudeCodeFeed.ConnectResult.Failed)
+            System.Windows.MessageBox.Show("Wisp couldn't update Claude Code's settings.json.", "Wisp",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        else
+            _tray.ShowBalloonTip(6000, "Connected to Claude Code",
+                "Wisp updates live whenever Claude Code is open. Restart any open Claude Code sessions to start.",
+                Forms.ToolTipIcon.Info);
     }
 
     void BuildTray()
@@ -47,7 +96,7 @@ public partial class App : Application
 
         _toggle = new Forms.ToolStripMenuItem("Hide", null, (_, _) => ToggleWidget());
         menu.Items.Add(_toggle);
-        menu.Items.Add(new Forms.ToolStripMenuItem("Refresh now", null, async (_, _) => await _widget.RefreshAsync()));
+        menu.Items.Add(new Forms.ToolStripMenuItem("Refresh now", null, async (_, _) => await _widget.RefreshAsync(force: true)));
 
         var position = new Forms.ToolStripMenuItem("Position");
         foreach (var (label, corner) in new[]
@@ -86,6 +135,14 @@ public partial class App : Application
         menu.Items.Add(look);
 
         menu.Items.Add(new Forms.ToolStripSeparator());
+        _claudeCode = new Forms.ToolStripMenuItem("Live updates from Claude Code") { Checked = ClaudeCodeFeed.IsConnected() };
+        _claudeCode.Click += (_, _) =>
+        {
+            if (_claudeCode.Checked) ClaudeCodeFeed.Disconnect();
+            else ConnectClaudeCode();
+            _claudeCode.Checked = ClaudeCodeFeed.IsConnected();
+        };
+        menu.Items.Add(_claudeCode);
         menu.Items.Add(new Forms.ToolStripMenuItem("claude.ai session key…", null, (_, _) => AskSessionKey()));
 
         var startup = new Forms.ToolStripMenuItem("Start with Windows") { Checked = IsStartupEnabled(), CheckOnClick = true };
@@ -120,7 +177,7 @@ public partial class App : Application
         string text;
         if (snap?.Session is { } s)
         {
-            text = $"Session {Math.Round(s.Percent):0}% · resets in {Wisp.MainWindow.FormatReset(s.ResetsAt)}";
+            text = $"Session {Math.Round(s.Percent):0}% · resets in {Format.Reset(s.ResetsAt)}";
             if (snap.Week is { } w) text += $" · week {Math.Round(w.Percent):0}%";
         }
         else

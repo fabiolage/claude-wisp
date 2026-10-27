@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -25,7 +26,8 @@ public partial class MainWindow : Window
     IntPtr _hwnd;
     UsageSnapshot? _last;
     bool _hovering;
-    int _failures;
+    DateTimeOffset? _lastApiAttempt;
+    FileSystemWatcher? _feedWatcher;
 
     public event Action<UsageSnapshot?, string?>? Updated;
 
@@ -48,7 +50,7 @@ public partial class MainWindow : Window
             await RefreshAsync();
         };
 
-        _refreshTimer.Interval = TimeSpan.FromSeconds(Math.Max(30, _settings.RefreshSeconds));
+        _refreshTimer.Interval = TimeSpan.FromSeconds(Math.Max(15, _settings.RefreshSeconds));
         _refreshTimer.Tick += async (_, _) => await RefreshAsync();
         _refreshTimer.Start();
 
@@ -59,6 +61,25 @@ public partial class MainWindow : Window
         _hoverTimer.Start();
 
         SystemEvents_DisplayChanged();
+        WatchFeed();
+    }
+
+    void WatchFeed()
+    {
+        try
+        {
+            Directory.CreateDirectory(ClaudeCodeFeed.FeedDirectory);
+            _feedWatcher = new FileSystemWatcher(ClaudeCodeFeed.FeedDirectory, ClaudeCodeFeed.FeedFileName)
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+            };
+            FileSystemEventHandler changed = (_, _) => Dispatcher.BeginInvoke(OnFeedChanged);
+            _feedWatcher.Changed += changed;
+            _feedWatcher.Created += changed;
+            _feedWatcher.Renamed += (_, _) => Dispatcher.BeginInvoke(OnFeedChanged);
+            _feedWatcher.EnableRaisingEvents = true;
+        }
+        catch { /* the minute timer still picks the feed up */ }
     }
 
     public UsageSnapshot? Last => _last;
@@ -117,25 +138,51 @@ public partial class MainWindow : Window
 
     // ---------- data ----------
 
-    public async Task RefreshAsync()
+    /// <summary>
+    /// Reads Claude Code's feed (free, local) every tick. Only when that's missing or stale does it ask
+    /// Anthropic, and then at most every <see cref="Settings.ApiMinutes"/> and never during a cooldown.
+    /// </summary>
+    public async Task RefreshAsync(bool force = false)
     {
         if (!await _fetchLock.WaitAsync(0)) return;
         try
         {
             PulseOnce();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            var snap = await _usage.FetchAsync(_settings.SessionKey, cts.Token);
-            _last = snap;
-            _failures = 0;
-            _refreshTimer.Interval = TimeSpan.FromSeconds(Math.Max(30, _settings.RefreshSeconds));
-            Render(snap, null);
-        }
-        catch (Exception e)
-        {
-            _failures++;
-            // Back off gently on repeated failures (max 5 minutes).
-            _refreshTimer.Interval = TimeSpan.FromSeconds(Math.Min(300, Math.Max(30, _settings.RefreshSeconds) * _failures));
-            Render(_last, e is UsageException ? e.Message : "Something went wrong");
+            var best = Newest(_last, ClaudeCodeFeed.Read());
+            string? error = null;
+
+            var now = DateTimeOffset.Now;
+            var feedFresh = best is { Source: "Claude Code" } && now - best.FetchedAt < TimeSpan.FromMinutes(3);
+            var apiDue = force || _lastApiAttempt == null ||
+                         now - _lastApiAttempt >= TimeSpan.FromMinutes(Math.Max(2, _settings.ApiMinutes));
+
+            if (!feedFresh && apiDue)
+            {
+                _lastApiAttempt = now;
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                    var snap = await _usage.FetchAsync(_settings.SessionKey, _settings.OAuthBlockedUntil, until =>
+                    {
+                        _settings.OAuthBlockedUntil = until;
+                        _settings.Save();
+                    }, cts.Token);
+                    best = Newest(best, snap);
+                }
+                catch (RateLimitedException e)
+                {
+                    // With numbers from Claude Code already on screen, a cooldown isn't worth mentioning.
+                    if (best == null)
+                        error = $"Anthropic paused updates · {Format.Duration(e.RetryAfter)}";
+                }
+                catch (Exception e)
+                {
+                    error = e is UsageException ? e.Message : "Something went wrong";
+                }
+            }
+
+            _last = best;
+            Render(best, error);
         }
         finally
         {
@@ -144,14 +191,41 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Claude Code just wrote new numbers; show them right away.</summary>
+    void OnFeedChanged()
+    {
+        var feed = ClaudeCodeFeed.Read();
+        if (feed == null || (_last != null && feed.FetchedAt <= _last.FetchedAt)) return;
+        _last = feed;
+        Render(feed, null);
+    }
+
+    static UsageSnapshot? Newest(UsageSnapshot? a, UsageSnapshot? b) =>
+        a == null ? b : b == null ? a : b.FetchedAt > a.FetchedAt ? b : a;
+
+    /// <summary>A window whose reset time has passed is back to zero, even if we haven't heard so yet.</summary>
+    static UsageWindow? Current(UsageWindow? w) =>
+        w is { ResetsAt: { } r } && r <= DateTimeOffset.Now ? w with { Percent = 0, ResetsAt = null } : w;
+
     void Tick()
     {
         if (_last == null) return;
-        // When a window resets, fetch right away instead of waiting for the next poll.
         if (_last.Session?.ResetsAt is { } r && r <= DateTimeOffset.Now)
+        {
+            Render(_last, null);
             _ = RefreshAsync();
+        }
         else
-            ResetText.Text = FormatReset(_last.Session?.ResetsAt);
+        {
+            ResetText.Text = Format.Reset(_last.Session?.ResetsAt);
+            LabelText.Text = AgeLabel(_last);
+        }
+    }
+
+    static string AgeLabel(UsageSnapshot snap)
+    {
+        var age = DateTimeOffset.Now - snap.FetchedAt;
+        return age < TimeSpan.FromMinutes(15) ? "5h session" : $"as of {Format.Ago(age)} ago";
     }
 
     void Render(UsageSnapshot? snap, string? error)
@@ -168,18 +242,19 @@ public partial class MainWindow : Window
             return;
         }
 
-        var session = snap.Session?.Percent ?? 0;
+        var sessionWindow = Current(snap.Session);
+        var session = sessionWindow?.Percent ?? 0;
         PercentText.Text = Math.Round(session).ToString("0");
-        ResetCaption.Text = snap.Session?.ResetsAt == null ? "session" : "resets in";
-        ResetText.Text = FormatReset(snap.Session?.ResetsAt);
-        LabelText.Text = "5h session";
+        ResetCaption.Text = sessionWindow?.ResetsAt == null ? "window" : "resets in";
+        ResetText.Text = sessionWindow?.ResetsAt == null ? "fresh" : Format.Reset(sessionWindow.ResetsAt);
+        LabelText.Text = AgeLabel(snap);
 
         var accent = AccentFor(session);
         AnimateWidth(SessionBar, SessionTrack.ActualWidth > 0 ? SessionTrack.ActualWidth : 196, session);
         SessionAccent.Color = accent;
         SessionGlow.Color = accent;
 
-        if (snap.Week is { } week)
+        if (Current(snap.Week) is { } week)
         {
             WeekRow.Visibility = Visibility.Visible;
             WeekText.Text = $"{Math.Round(week.Percent):0}%";
@@ -190,7 +265,7 @@ public partial class MainWindow : Window
             WeekRow.Visibility = Visibility.Collapsed;
         }
 
-        Updated?.Invoke(snap, error);
+        Updated?.Invoke(snap with { Session = sessionWindow, Week = Current(snap.Week) }, error);
     }
 
     static void AnimateWidth(FrameworkElement bar, double trackWidth, double percent) =>
@@ -215,19 +290,10 @@ public partial class MainWindow : Window
         (byte)(a.G + (b.G - a.G) * t),
         (byte)(a.B + (b.B - a.B) * t));
 
-    public static string FormatReset(DateTimeOffset? at)
-    {
-        if (at == null) return "—";
-        var left = at.Value - DateTimeOffset.Now;
-        if (left <= TimeSpan.Zero) return "now";
-        if (left.TotalDays >= 1) return $"{(int)left.TotalDays}d {left.Hours}h";
-        if (left.TotalHours >= 1) return $"{(int)left.TotalHours}h {left.Minutes:00}m";
-        return $"{Math.Max(1, (int)Math.Ceiling(left.TotalMinutes))}m";
-    }
-
     protected override void OnClosed(EventArgs e)
     {
         _usage.Dispose();
+        _feedWatcher?.Dispose();
         base.OnClosed(e);
     }
 }

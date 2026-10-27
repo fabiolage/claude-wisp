@@ -9,6 +9,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>Wisp</AssemblyName>
     <RootNamespace>Wisp</RootNamespace>
+    <StartupObject>Wisp.Program</StartupObject>
     <ApplicationIcon>wisp.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <Product>Wisp</Product>

@@ -15,12 +15,11 @@ It's see-through and click-through (your mouse passes right through it), it fade
 
 ## Where the numbers come from
 
-Wisp reads the same data Claude shows on its own usage page:
+1. **Claude Code, live (best).** Right-click the tray ghost → *Live updates from Claude Code* (Wisp also offers this on first launch). Wisp registers itself as Claude Code's status line, so every time Claude Code redraws, it hands Wisp your current 5-hour and weekly usage. No polling, no rate limits, and you get a compact usage line inside Claude Code too. Your previous `settings.json` is backed up as `settings.json.wisp-backup`.
+2. **Anthropic's usage endpoint (fallback).** If you've signed in to Claude Code, Wisp can also ask Anthropic directly using that login, read-only. This endpoint rate-limits third-party apps hard, so Wisp only calls it every 10 minutes when there's no fresh Claude Code data, and backs off for as long as Anthropic asks.
+3. **claude.ai session key.** Not using Claude Code? Right-click the tray ghost → *claude.ai session key…* and paste your `sessionKey` cookie from claude.ai. It's encrypted with Windows DPAPI so only your Windows user can read it.
 
-1. **Claude Code login (automatic).** If you've signed in to Claude Code on this PC, Wisp reads the token in `%USERPROFILE%\.claude\.credentials.json` and asks Anthropic for your usage. Wisp never changes that file. If the login expires, just open Claude Code once and Wisp picks it up again.
-2. **claude.ai session key (fallback).** Not using Claude Code? Right-click the tray ghost → *claude.ai session key…* and paste your `sessionKey` cookie from claude.ai. It's encrypted with Windows DPAPI so only your Windows user can read it.
-
-Both endpoints are unofficial and could change; if numbers stop appearing, check for a new release.
+The endpoints in 2 and 3 are unofficial and could change.
 
 ## Options (tray menu)
 
