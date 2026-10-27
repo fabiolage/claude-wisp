@@ -1,0 +1,68 @@
+name: Build Wisp
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      VERSION: 0.1.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish small build (needs .NET Desktop Runtime 10)
+        run: >
+          dotnet publish src/Wisp/Wisp.csproj -c Release -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:Version=${{ env.VERSION }}
+          -o out/small
+
+      - name: Publish portable build (no install needed)
+        run: >
+          dotnet publish src/Wisp/Wisp.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:Version=${{ env.VERSION }}
+          -o out/portable
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item out/portable/Wisp.exe dist/Wisp.exe
+          Copy-Item out/small/Wisp.exe dist/Wisp-small.exe
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wisp-${{ env.VERSION }}
+          path: dist/*
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          **Wisp.exe**: download and run, nothing to install.
+          **Wisp-small.exe**: much smaller, but needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) installed.
+
+          Commit: ${{ github.sha }}
+          "@
+          gh release create "v$env:VERSION" dist/Wisp.exe dist/Wisp-small.exe `
+            --title "Wisp $env:VERSION" --notes $notes --target ${{ github.sha }} --latest
